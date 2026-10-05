@@ -1,5 +1,9 @@
 # Changelog
 
+## [1.0.2] - 2026-10-05
+
+- Updated the NuGet package author metadata.
+
 ## [1.0.1] - 2026-09-25
 
 - Fixed empty objects and arrays overriding scalar values at the same key.
