@@ -1,0 +1,763 @@
+using System.Buffers.Binary;
+using System.Diagnostics;
+using System.Runtime.InteropServices;
+using System.Runtime.Versioning;
+using System.Text.Json;
+using AppSettings.Materializer;
+using Microsoft.Extensions.Configuration;
+using Xunit;
+
+namespace AppSettings.Materializer.Tests;
+
+public sealed class ConfigurationMaterializerTests
+{
+    private const string LinuxAclAttribute = "system.posix_acl_access";
+    private const string LinuxDefaultAclAttribute = "system.posix_acl_default";
+    private const int LinuxErrorNoData = 61;
+
+    [Fact]
+    public void Materialize_preserves_configuration_values_and_array_inheritance()
+    {
+        using var files = new TemporaryFiles();
+        var baseFile = files.Write(
+            "appsettings.json",
+            """
+            {
+              // JSON comments are accepted by the configuration provider.
+              "AppConfig": {
+                "Enabled": true,
+                "RetryCount": 3,
+                "Threshold": 1.5,
+                "ApiKeyUsers": [
+                  { "UserName": "admin", "Role": "base" },
+                  { "UserName": "guest" }
+                ]
+              },
+              "Keep": "base",
+              "NullValue": null,
+              "EmptyObject": {},
+              "EmptyArray": [],
+              "Unicode": "Grüße"
+            }
+            """);
+        var overrideFile = files.Write(
+            "appsettings.Integration.json",
+            """
+            {
+              "AppConfig": {
+                "Enabled": false,
+                "RetryCount": 5,
+                "ApiKeyUsers": [
+                  { "Role": "override" },
+                ]
+              },
+              "NewValue": "new"
+            }
+            """);
+        var outputFile = files.PathFor("effective.json");
+
+        var result = new ConfigurationMaterializer().Materialize(
+            new MaterializerOptions
+            {
+                InputFiles = [baseFile, overrideFile],
+                OutputFile = outputFile,
+                PrettyPrint = true
+            });
+
+        Assert.True(result.WasWritten);
+        Assert.True(result.EffectiveKeyCount > 0);
+        var source = BuildConfiguration(baseFile, overrideFile);
+        var materialized = new ConfigurationBuilder()
+            .AddJsonFile(outputFile, optional: false, reloadOnChange: false)
+            .Build();
+
+        AssertConfigurationEqual(source, materialized);
+        Assert.Equal("Grüße", materialized["Unicode"]);
+        Assert.Equal(JsonValueKind.False, ReadJson(outputFile).RootElement.GetProperty("AppConfig").GetProperty("Enabled").ValueKind);
+        Assert.Equal(JsonValueKind.Number, ReadJson(outputFile).RootElement.GetProperty("AppConfig").GetProperty("RetryCount").ValueKind);
+        Assert.Equal(JsonValueKind.Array, ReadJson(outputFile).RootElement.GetProperty("AppConfig").GetProperty("ApiKeyUsers").ValueKind);
+        Assert.Equal(JsonValueKind.Object, ReadJson(outputFile).RootElement.GetProperty("EmptyObject").ValueKind);
+        Assert.Equal(JsonValueKind.Array, ReadJson(outputFile).RootElement.GetProperty("EmptyArray").ValueKind);
+        Assert.Empty(Directory.GetFiles(files.Directory, ".effective.json.*.tmp"));
+    }
+
+    [Fact]
+    public void Materialize_rejects_scalar_object_conflicts_that_json_cannot_represent()
+    {
+        using var files = new TemporaryFiles();
+        var baseFile = files.Write("base.json", "{ \"Section\": { \"Child\": \"base\" } }");
+        var overrideFile = files.Write("override.json", "{ \"Section\": \"scalar\" }");
+
+        var exception = Assert.Throws<MaterializerException>(() => new ConfigurationMaterializer().Materialize(
+            new MaterializerOptions
+            {
+                InputFiles = [baseFile, overrideFile],
+                OutputFile = files.PathFor("effective.json")
+            }));
+
+        Assert.Contains("Skalar-/Objektkonflikt", exception.Message, StringComparison.Ordinal);
+    }
+
+    [Theory]
+    [InlineData("{ \"Section\": \"base\" }", "{ \"Section\": {} }", JsonValueKind.Object)]
+    [InlineData("{ \"Section\": \"base\" }", "{ \"Section\": [] }", JsonValueKind.Array)]
+    [InlineData("{ \"Section\": {} }", "{ \"Section\": \"override\" }", JsonValueKind.String)]
+    [InlineData("{ \"Section\": [] }", "{ \"Section\": \"override\" }", JsonValueKind.String)]
+    public void Materialize_roundtrips_latest_scalar_or_empty_shape_at_same_key(
+        string baseJson,
+        string overrideJson,
+        JsonValueKind expectedKind)
+    {
+        using var files = new TemporaryFiles();
+        var baseFile = files.Write("base.json", baseJson);
+        var overrideFile = files.Write("override.json", overrideJson);
+        var outputFile = files.PathFor("effective.json");
+
+        new ConfigurationMaterializer().Materialize(
+            new MaterializerOptions
+            {
+                InputFiles = [baseFile, overrideFile],
+                OutputFile = outputFile
+            });
+
+        var source = BuildConfiguration(baseFile, overrideFile);
+        var materialized = new ConfigurationBuilder()
+            .AddJsonFile(outputFile, optional: false, reloadOnChange: false)
+            .Build();
+
+        AssertConfigurationEqual(source, materialized);
+        Assert.Equal(expectedKind, ReadJson(outputFile).RootElement.GetProperty("Section").ValueKind);
+    }
+
+    [Fact]
+    public void Materialize_rejects_array_gaps()
+    {
+        using var files = new TemporaryFiles();
+        var input = files.Write("input.json", "{ \"Items\": { \"1\": \"only index one\" } }");
+
+        var exception = Assert.Throws<MaterializerException>(() => new ConfigurationMaterializer().Materialize(
+            new MaterializerOptions
+            {
+                InputFiles = [input],
+                OutputFile = files.PathFor("effective.json")
+            }));
+
+        Assert.Contains("Lücke", exception.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void Materialize_honors_case_insensitive_configuration_keys()
+    {
+        using var files = new TemporaryFiles();
+        var baseFile = files.Write("base.json", "{ \"Section\": { \"Value\": \"base\" } }");
+        var overrideFile = files.Write("override.json", "{ \"section\": { \"value\": \"override\" } }");
+        var outputFile = files.PathFor("effective.json");
+
+        new ConfigurationMaterializer().Materialize(
+            new MaterializerOptions
+            {
+                InputFiles = [baseFile, overrideFile],
+                OutputFile = outputFile
+            });
+
+        var output = new ConfigurationBuilder().AddJsonFile(outputFile).Build();
+        Assert.Equal("override", output["SECTION:VALUE"]);
+        Assert.Single(ReadJson(outputFile).RootElement.EnumerateObject());
+    }
+
+    [Fact]
+    public void Materialize_preserves_empty_root_configuration_key()
+    {
+        using var files = new TemporaryFiles();
+        var input = files.Write("input.json", "{ \"\": \"value\" }");
+        var outputFile = files.PathFor("effective.json");
+
+        var result = new ConfigurationMaterializer().Materialize(
+            new MaterializerOptions
+            {
+                InputFiles = [input],
+                OutputFile = outputFile
+            });
+
+        Assert.Equal(1, result.EffectiveKeyCount);
+        Assert.Equal("value", new ConfigurationBuilder().AddJsonFile(outputFile).Build()[""]);
+        Assert.Equal("value", ReadJson(outputFile).RootElement.GetProperty("").GetString());
+    }
+
+    [Fact]
+    public void Materialize_check_only_does_not_write_and_returns_hash()
+    {
+        using var files = new TemporaryFiles();
+        var input = files.Write("input.json", "{ \"Value\": 1 }");
+        var output = files.PathFor("effective.json");
+
+        var result = new ConfigurationMaterializer().Materialize(
+            new MaterializerOptions
+            {
+                InputFiles = [input],
+                OutputFile = output,
+                CheckOnly = true
+            });
+
+        Assert.False(result.WasWritten);
+        Assert.False(File.Exists(output));
+        Assert.Equal(64, result.OutputSha256.Length);
+    }
+
+    [Fact]
+    public void Materialize_does_not_overwrite_without_explicit_permission()
+    {
+        using var files = new TemporaryFiles();
+        var input = files.Write("input.json", "{ \"Value\": 1 }");
+        var output = files.Write("effective.json", "{ \"Value\": 99 }");
+
+        Assert.Throws<MaterializerException>(() => new ConfigurationMaterializer().Materialize(
+            new MaterializerOptions
+            {
+                InputFiles = [input],
+                OutputFile = output
+            }));
+        Assert.Equal("{ \"Value\": 99 }", File.ReadAllText(output));
+    }
+
+    [Fact]
+    public void Materialize_does_not_replace_destination_created_after_initial_check()
+    {
+        using var files = new TemporaryFiles();
+        var input = files.Write("input.json", "{ \"Value\": 1 }");
+        var output = files.PathFor("effective.json");
+        const string concurrentContent = "{ \"Value\": 99 }";
+        var hookInvoked = false;
+
+        var exception = Assert.Throws<MaterializerException>(() => new ConfigurationMaterializer(() =>
+        {
+            hookInvoked = true;
+            File.WriteAllText(output, concurrentContent);
+        }).Materialize(
+            new MaterializerOptions
+            {
+                InputFiles = [input],
+                OutputFile = output
+            }));
+
+        Assert.True(hookInvoked);
+        Assert.Equal("Die Ausgabedatei existiert bereits. Verwende --overwrite, um sie zu ersetzen.", exception.Message);
+        Assert.Equal(concurrentContent, File.ReadAllText(output));
+        Assert.Equal(
+            ["effective.json", "input.json"],
+            Directory.EnumerateFileSystemEntries(files.Directory)
+                .Select(path => Path.GetFileName(path)!)
+                .OrderBy(name => name, StringComparer.Ordinal)
+                .ToArray());
+    }
+
+    [Fact]
+    public void Materialize_replaces_destination_created_after_initial_check_when_overwrite_is_allowed()
+    {
+        using var files = new TemporaryFiles();
+        var input = files.Write("input.json", "{ \"Value\": 1 }");
+        var output = files.PathFor("effective.json");
+        var hookInvoked = false;
+
+        var result = new ConfigurationMaterializer(() =>
+        {
+            hookInvoked = true;
+            File.WriteAllText(output, "{ \"Value\": 99 }");
+        }).Materialize(
+            new MaterializerOptions
+            {
+                InputFiles = [input],
+                OutputFile = output,
+                Overwrite = true
+            });
+
+        Assert.True(hookInvoked);
+        Assert.True(result.WasWritten);
+        Assert.Equal("1", new ConfigurationBuilder().AddJsonFile(output).Build()["Value"]);
+        Assert.Equal(
+            ["effective.json", "input.json"],
+            Directory.EnumerateFileSystemEntries(files.Directory)
+                .Select(path => Path.GetFileName(path)!)
+                .OrderBy(name => name, StringComparer.Ordinal)
+                .ToArray());
+    }
+
+    [Fact]
+    public void Materialize_preserves_existing_unix_mode_when_overwriting()
+    {
+        if (OperatingSystem.IsWindows())
+        {
+            return;
+        }
+
+        using var files = new TemporaryFiles();
+        var input = files.Write("input.json", "{ \"Value\": 1 }");
+        var output = files.Write("effective.json", "{ \"Value\": 99 }");
+        var expectedMode = UnixFileMode.UserRead | UnixFileMode.UserWrite;
+        File.SetUnixFileMode(output, expectedMode);
+
+        new ConfigurationMaterializer().Materialize(
+            new MaterializerOptions
+            {
+                InputFiles = [input],
+                OutputFile = output,
+                Overwrite = true
+            });
+
+        Assert.Equal(expectedMode, File.GetUnixFileMode(output));
+    }
+
+    [Fact]
+    public void Materialize_preserves_linux_acl_when_group_access_is_narrower_than_mode()
+    {
+        if (!OperatingSystem.IsLinux())
+        {
+            return;
+        }
+
+        using var files = new TemporaryFiles();
+        var input = files.Write("input.json", "{ \"Value\": 1 }");
+        var output = files.Write("effective.json", "{ \"Value\": 99 }");
+        var expectedMode = UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.GroupRead;
+        File.SetUnixFileMode(output, expectedMode);
+        var expectedAcl = CreateLinuxAcl(
+            (0x01, 0x06, uint.MaxValue),
+            (0x04, 0x00, uint.MaxValue),
+            (0x10, 0x04, uint.MaxValue),
+            (0x20, 0x00, uint.MaxValue));
+        Assert.Equal(0, LinuxSetXAttr(output, LinuxAclAttribute, expectedAcl, (nuint)expectedAcl.Length, 0));
+        Assert.Equal(expectedMode, File.GetUnixFileMode(output));
+
+        new ConfigurationMaterializer().Materialize(
+            new MaterializerOptions
+            {
+                InputFiles = [input],
+                OutputFile = output,
+                Overwrite = true
+            });
+
+        Assert.Equal(expectedMode, File.GetUnixFileMode(output));
+        Assert.Equal(expectedAcl, ReadLinuxAcl(output));
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void Materialize_does_not_inherit_linux_parent_default_acl(bool overwrite)
+    {
+        if (!OperatingSystem.IsLinux())
+        {
+            return;
+        }
+
+        using var files = new TemporaryFiles();
+        var input = files.Write("input.json", "{ \"Value\": 1 }");
+        var output = files.PathFor("effective.json");
+        if (overwrite)
+        {
+            File.WriteAllText(output, "{ \"Value\": 99 }");
+            File.SetUnixFileMode(output, UnixFileMode.UserRead | UnixFileMode.UserWrite);
+        }
+
+        SetLinuxAcl(
+            files.Directory,
+            LinuxDefaultAclAttribute,
+            CreateLinuxAcl(
+                (0x01, 0x07, uint.MaxValue),
+                (0x04, 0x00, uint.MaxValue),
+                (0x08, 0x04, 12345),
+                (0x10, 0x04, uint.MaxValue),
+                (0x20, 0x00, uint.MaxValue)));
+
+        new ConfigurationMaterializer().Materialize(
+            new MaterializerOptions
+            {
+                InputFiles = [input],
+                OutputFile = output,
+                Overwrite = overwrite
+            });
+
+        Assert.Equal(UnixFileMode.UserRead | UnixFileMode.UserWrite, File.GetUnixFileMode(output));
+        AssertNoLinuxAcl(output, LinuxAclAttribute);
+        Assert.Empty(Directory.GetDirectories(files.Directory, ".appsettings-materializer-*.tmp"));
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void Materialize_preserves_setgid_parent_group_on_linux(bool overwrite)
+    {
+        if (!OperatingSystem.IsLinux())
+        {
+            return;
+        }
+
+        var effectiveGroup = LinuxGetEffectiveGroupId();
+        var supplementaryGroups = GetLinuxSupplementaryGroupIds();
+        var targetGroup = supplementaryGroups
+            .Where(group => group != effectiveGroup)
+            .Select(group => (uint?)group)
+            .FirstOrDefault();
+        if (targetGroup is null)
+        {
+            return;
+        }
+
+        using var files = new TemporaryFiles();
+        var input = files.Write("input.json", "{ \"Value\": 1 }");
+        var output = files.PathFor("effective.json");
+        if (overwrite)
+        {
+            File.WriteAllText(output, "{ \"Value\": 99 }");
+            File.SetUnixFileMode(output, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.GroupRead);
+        }
+
+        Assert.Equal(0, LinuxChown(files.Directory, uint.MaxValue, targetGroup.Value));
+        File.SetUnixFileMode(
+            files.Directory,
+            UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute | UnixFileMode.SetGroup);
+
+        new ConfigurationMaterializer().Materialize(
+            new MaterializerOptions
+            {
+                InputFiles = [input],
+                OutputFile = output,
+                Overwrite = overwrite
+            });
+
+        Assert.Equal(targetGroup.Value, GetLinuxFileGroup(output));
+        Assert.Empty(Directory.GetDirectories(files.Directory, ".appsettings-materializer-*.tmp"));
+    }
+
+    [Fact]
+    public void Materialize_creates_new_unix_output_as_owner_only()
+    {
+        if (OperatingSystem.IsWindows())
+        {
+            return;
+        }
+
+        using var files = new TemporaryFiles();
+        var input = files.Write("input.json", "{ \"Value\": 1 }");
+        var output = files.PathFor("effective.json");
+
+        new ConfigurationMaterializer().Materialize(
+            new MaterializerOptions
+            {
+                InputFiles = [input],
+                OutputFile = output
+            });
+
+        Assert.Equal(UnixFileMode.UserRead | UnixFileMode.UserWrite, File.GetUnixFileMode(output));
+    }
+
+    [Fact]
+    public void Materialize_preserves_existing_macos_acl_when_overwriting()
+    {
+        if (!OperatingSystem.IsMacOS())
+        {
+            return;
+        }
+
+        using var files = new TemporaryFiles();
+        var input = files.Write("input.json", "{ \"Value\": 1 }");
+        var output = files.Write("effective.json", "{ \"Value\": 99 }");
+        File.SetUnixFileMode(output, UnixFileMode.UserRead | UnixFileMode.UserWrite);
+
+        using (var addAcl = Process.Start(new ProcessStartInfo("/bin/chmod")
+               {
+                   UseShellExecute = false,
+                   ArgumentList = { "+a", "everyone allow read", output }
+               })!)
+        {
+            addAcl.WaitForExit();
+            Assert.Equal(0, addAcl.ExitCode);
+        }
+
+        new ConfigurationMaterializer().Materialize(
+            new MaterializerOptions
+            {
+                InputFiles = [input],
+                OutputFile = output,
+                Overwrite = true
+            });
+
+        using var listAcl = Process.Start(new ProcessStartInfo("/bin/ls")
+        {
+            UseShellExecute = false,
+            RedirectStandardOutput = true,
+            ArgumentList = { "-le", output }
+        })!;
+        var listing = listAcl.StandardOutput.ReadToEnd();
+        listAcl.WaitForExit();
+        Assert.Equal(0, listAcl.ExitCode);
+        Assert.Contains("everyone allow read", listing, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void Materialize_does_not_inherit_macos_directory_acl(bool overwrite)
+    {
+        if (!OperatingSystem.IsMacOS())
+        {
+            return;
+        }
+
+        using var files = new TemporaryFiles();
+        var input = files.Write("input.json", "{ \"Value\": 1 }");
+        var output = files.PathFor("effective.json");
+        if (overwrite)
+        {
+            File.WriteAllText(output, "{ \"Value\": 99 }");
+            File.SetUnixFileMode(output, UnixFileMode.UserRead | UnixFileMode.UserWrite);
+            Assert.DoesNotContain("everyone", ListMacAcl(output), StringComparison.OrdinalIgnoreCase);
+        }
+
+        var directory = Path.GetDirectoryName(output)!;
+        using (var addAcl = Process.Start(new ProcessStartInfo("/bin/chmod")
+               {
+                   UseShellExecute = false,
+                   ArgumentList = { "+a", "everyone allow list,add_file,search,delete_child,file_inherit,directory_inherit", directory }
+               })!)
+        {
+            addAcl.WaitForExit();
+            Assert.Equal(0, addAcl.ExitCode);
+        }
+
+        new ConfigurationMaterializer().Materialize(
+            new MaterializerOptions
+            {
+                InputFiles = [input],
+                OutputFile = output,
+                Overwrite = overwrite
+            });
+
+        Assert.DoesNotContain("everyone", ListMacAcl(output), StringComparison.OrdinalIgnoreCase);
+        Assert.Equal(UnixFileMode.UserRead | UnixFileMode.UserWrite, File.GetUnixFileMode(output));
+        Assert.Empty(Directory.GetDirectories(files.Directory, ".appsettings-materializer-*.tmp"));
+    }
+
+    private static string ListMacAcl(string path)
+    {
+        using var listAcl = Process.Start(new ProcessStartInfo("/bin/ls")
+        {
+            UseShellExecute = false,
+            RedirectStandardOutput = true,
+            ArgumentList = { "-le", path }
+        })!;
+        var listing = listAcl.StandardOutput.ReadToEnd();
+        listAcl.WaitForExit();
+        Assert.Equal(0, listAcl.ExitCode);
+        return listing;
+    }
+
+    [Fact]
+    public void Materialize_reports_missing_files_without_writing()
+    {
+        using var files = new TemporaryFiles();
+
+        var exception = Assert.Throws<MaterializerException>(() => new ConfigurationMaterializer().Materialize(
+            new MaterializerOptions
+            {
+                InputFiles = [files.PathFor("missing.json")],
+                OutputFile = files.PathFor("effective.json")
+            }));
+
+        Assert.Contains("nicht gefunden", exception.Message, StringComparison.Ordinal);
+        Assert.False(File.Exists(files.PathFor("effective.json")));
+    }
+
+    [Fact]
+    public void Materialize_rejects_invalid_json_without_writing()
+    {
+        using var files = new TemporaryFiles();
+        var input = files.Write("invalid.json", "{ \"Value\": ");
+        var output = files.PathFor("effective.json");
+
+        var exception = Assert.Throws<MaterializerException>(() => new ConfigurationMaterializer().Materialize(
+            new MaterializerOptions
+            {
+                InputFiles = [input],
+                OutputFile = output
+            }));
+
+        Assert.Contains("ungültiges JSON", exception.Message, StringComparison.Ordinal);
+        Assert.False(File.Exists(output));
+    }
+
+    [Fact]
+    public void Materialize_can_skip_missing_files_when_explicitly_allowed()
+    {
+        using var files = new TemporaryFiles();
+        var input = files.Write("input.json", "{ \"Value\": 1 }");
+        var output = files.PathFor("effective.json");
+
+        var result = new ConfigurationMaterializer().Materialize(
+            new MaterializerOptions
+            {
+                InputFiles = [input, files.PathFor("optional.json")],
+                OutputFile = output,
+                AllowMissingFiles = true
+            });
+
+        Assert.Single(result.Warnings);
+        Assert.Equal("1", new ConfigurationBuilder().AddJsonFile(output).Build()["Value"]);
+    }
+
+    private static IConfigurationRoot BuildConfiguration(params string[] files)
+    {
+        var builder = new ConfigurationBuilder();
+        foreach (var file in files)
+        {
+            builder.AddJsonFile(file, optional: false, reloadOnChange: false);
+        }
+
+        return builder.Build();
+    }
+
+    private static Dictionary<string, string?> Read(IConfiguration configuration)
+    {
+        return configuration.AsEnumerable(true)
+            .Where(entry => !string.IsNullOrEmpty(entry.Key))
+            .ToDictionary(entry => entry.Key, entry => entry.Value, StringComparer.OrdinalIgnoreCase);
+    }
+
+    private static void AssertConfigurationEqual(IConfiguration expected, IConfiguration actual)
+    {
+        Assert.Equal(Read(expected), Read(actual));
+    }
+
+    private static JsonDocument ReadJson(string path)
+    {
+        return JsonDocument.Parse(File.ReadAllText(path));
+    }
+
+    private static byte[] CreateLinuxAcl(params (ushort Tag, ushort Permissions, uint Id)[] entries)
+    {
+        var acl = new byte[4 + entries.Length * 8];
+        BitConverter.TryWriteBytes(acl.AsSpan(0, 4), 2u);
+        for (var index = 0; index < entries.Length; index++)
+        {
+            var offset = 4 + index * 8;
+            BitConverter.TryWriteBytes(acl.AsSpan(offset, 2), entries[index].Tag);
+            BitConverter.TryWriteBytes(acl.AsSpan(offset + 2, 2), entries[index].Permissions);
+            BitConverter.TryWriteBytes(acl.AsSpan(offset + 4, 4), entries[index].Id);
+        }
+
+        return acl;
+    }
+
+    private static byte[] ReadLinuxAcl(string path)
+    {
+        var size = LinuxGetXAttr(path, LinuxAclAttribute, IntPtr.Zero, 0);
+        Assert.True(size > 0, $"Die POSIX-ACL konnte nicht gelesen werden: errno {Marshal.GetLastPInvokeError()}.");
+        var acl = new byte[checked((int)size)];
+        Assert.Equal((nint)acl.Length, LinuxGetXAttr(path, LinuxAclAttribute, acl, (nuint)acl.Length));
+        return acl;
+    }
+
+    private static void SetLinuxAcl(string path, string attribute, byte[] acl)
+    {
+        Assert.Equal(0, LinuxSetXAttr(path, attribute, acl, (nuint)acl.Length, 0));
+    }
+
+    private static void AssertNoLinuxAcl(string path, string attribute)
+    {
+        Assert.Equal((nint)(-1), LinuxGetXAttr(path, attribute, IntPtr.Zero, 0));
+        Assert.Equal(LinuxErrorNoData, Marshal.GetLastPInvokeError());
+    }
+
+    [SupportedOSPlatform("linux")]
+    private static uint[] GetLinuxSupplementaryGroupIds()
+    {
+        var count = LinuxGetSupplementaryGroupIds(0, null);
+        Assert.True(count >= 0, $"Supplementary groups could not be read: errno {Marshal.GetLastPInvokeError()}.");
+        var groups = new uint[count];
+        Assert.Equal(count, LinuxGetSupplementaryGroupIds(count, groups));
+        return groups;
+    }
+
+    [SupportedOSPlatform("linux")]
+    private static uint GetLinuxFileGroup(string path)
+    {
+        var stat = new byte[256];
+        Assert.Equal(0, LinuxStatx(-100, path, 0, 0x10, stat));
+        return BinaryPrimitives.ReadUInt32LittleEndian(stat.AsSpan(24, 4));
+    }
+
+    [SupportedOSPlatform("linux")]
+    [DllImport("libc", EntryPoint = "getegid", SetLastError = true)]
+    private static extern uint LinuxGetEffectiveGroupId();
+
+    [SupportedOSPlatform("linux")]
+    [DllImport("libc", EntryPoint = "getgroups", SetLastError = true)]
+    private static extern int LinuxGetSupplementaryGroupIds(int size, [Out] uint[]? groups);
+
+    [SupportedOSPlatform("linux")]
+    [DllImport("libc", EntryPoint = "chown", CharSet = CharSet.Ansi, BestFitMapping = false, ThrowOnUnmappableChar = true, SetLastError = true)]
+    private static extern int LinuxChown(
+        [MarshalAs(UnmanagedType.LPUTF8Str)] string path,
+        uint owner,
+        uint group);
+
+    [SupportedOSPlatform("linux")]
+    [DllImport("libc", EntryPoint = "statx", CharSet = CharSet.Ansi, BestFitMapping = false, ThrowOnUnmappableChar = true, SetLastError = true)]
+    private static extern int LinuxStatx(
+        int directoryFileDescriptor,
+        [MarshalAs(UnmanagedType.LPUTF8Str)] string path,
+        int flags,
+        uint mask,
+        [Out] byte[] stat);
+
+    [DllImport("libc", EntryPoint = "setxattr", CharSet = CharSet.Ansi, BestFitMapping = false, ThrowOnUnmappableChar = true, SetLastError = true)]
+    private static extern int LinuxSetXAttr(
+        [MarshalAs(UnmanagedType.LPUTF8Str)] string path,
+        [MarshalAs(UnmanagedType.LPUTF8Str)] string name,
+        [In] byte[] value,
+        nuint size,
+        int flags);
+
+    [DllImport("libc", EntryPoint = "getxattr", CharSet = CharSet.Ansi, BestFitMapping = false, ThrowOnUnmappableChar = true, SetLastError = true)]
+    private static extern nint LinuxGetXAttr(
+        [MarshalAs(UnmanagedType.LPUTF8Str)] string path,
+        [MarshalAs(UnmanagedType.LPUTF8Str)] string name,
+        IntPtr value,
+        nuint size);
+
+    [DllImport("libc", EntryPoint = "getxattr", CharSet = CharSet.Ansi, BestFitMapping = false, ThrowOnUnmappableChar = true, SetLastError = true)]
+    private static extern nint LinuxGetXAttr(
+        [MarshalAs(UnmanagedType.LPUTF8Str)] string path,
+        [MarshalAs(UnmanagedType.LPUTF8Str)] string name,
+        [Out] byte[] value,
+        nuint size);
+
+    private sealed class TemporaryFiles : IDisposable
+    {
+        private readonly string directory = Path.Combine(Path.GetTempPath(), $"appsettings-materializer-{Guid.NewGuid():N}");
+
+        public TemporaryFiles()
+        {
+            System.IO.Directory.CreateDirectory(directory);
+        }
+
+        public string PathFor(string name) => Path.Combine(directory, name);
+
+        public string Directory => directory;
+
+        public string Write(string name, string content)
+        {
+            var path = PathFor(name);
+            File.WriteAllText(path, content);
+            return path;
+        }
+
+        public void Dispose()
+        {
+            if (System.IO.Directory.Exists(directory))
+            {
+                System.IO.Directory.Delete(directory, recursive: true);
+            }
+        }
+    }
+}
